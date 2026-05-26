@@ -4,19 +4,19 @@ import numpy as np
 import pyrealsense2 as rs
 
 # =====================================================================
-# 1. KONFIGURASI AWAL HARDWARE & STREAM REALSENSE D405
+# 1. KONFIGURASI HARDWARE & STREAM REALSENSE D405
 # =====================================================================
 pipeline = rs.pipeline()
 config = rs.config()
 
-# Mengaktifkan stream Depth dan Color (Resolusi standar 640x480 pada 30 FPS)
+# Mengaktifkan stream Depth dan Color (Resolusi 640x480 pada 30 FPS)
 config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
 # Memulai pembacaan sensor
 profile = pipeline.start(config)
 
-# Mengambil depth scale dari sensor (Untuk konversi nilai mentah ke satuan meter/mm)
+# Mengambil depth scale dari sensor untuk konversi ke satuan mm
 depth_sensor = profile.get_device().first_depth_sensor()
 depth_scale = depth_sensor.get_depth_scale()
 
@@ -25,18 +25,17 @@ align_to = rs.stream.color
 align = rs.align(align_to)
 
 # =====================================================================
-# 2. KONFIGURASI PARAMETER FILTER RESEARCH (METOPEN)
+# 2. PARAMETER KONTROL & FILTER (RESEARCH METOPEN)
 # =====================================================================
-# Batasan jarak deteksi (dalam milimeter): 100mm (10cm) hingga 500mm (50cm)
-# Sesuai misi: menganalisa track pada rentang 40cm ke depan.
+# Jarak deteksi sesuai misi: kisaran 40cm ke depan (100mm - 500mm)
 DIST_MIN_MM = 100 
 DIST_MAX_MM = 500
 
-# Threshold toleransi kedalaman lantai aman (dalam milimeter)
-# Jika jarak lantai ke kamera mendadak turun/lebih dalam dari nilai ini, dianggap "jurang"
+# Batas toleransi kedalaman lantai aman (dalam milimeter)
+# Jika jarak lantai ke kamera mendadak lebih dalam dari nilai ini, dianggap "jurang"
 FLOOR_THRESHOLD_MM = 450 
 
-# Inisialisasi variabel untuk perhitungan FPS
+# Inisialisasi variabel waktu untuk perhitungan FPS
 prev_frame_time = 0
 
 print("=== Program Utama Intel RealSense D405 untuk KRSRI Berhasil Dijalankan ===")
@@ -45,7 +44,7 @@ print("Tekan tombol 'q' pada jendela grafis untuk keluar.")
 try:
     while True:
         # =====================================================================
-        # 3. AKUISISI DATA & ALIGNMENT FRAME
+        # 3. AKUISISI DATA & SINKRONISASI FRAME
         # =====================================================================
         frames = pipeline.wait_for_frames()
         aligned_frames = align.process(frames)
@@ -60,88 +59,99 @@ try:
         depth_raw = np.asanyarray(depth_frame.get_data())
         color_image = np.asanyarray(color_frame.get_data())
         
+        # Dapatkan dimensi frame (Lebar: 640, Tinggi: 480)
+        tinggi_frame, lebar_frame, _ = color_image.shape
+        
         # Konversi matriks depth mentah langsung ke satuan milimeter riil
         depth_mm = depth_raw * depth_scale * 1000
         
         # =====================================================================
-        # 4. IMPLEMENTASI FILTERING DATA (PROSES PCL/DEPTH)
+        # 4. PROSES FILTERING DATA DEPTH
         # =====================================================================
-        # Filter Spasial Jarak: Ambil data yang murni berada di rentang area 40cm target
+        # Filter Jarak: Hanya ambil data di rentang target 40cm
         mask_jarak = (depth_mm > DIST_MIN_MM) & (depth_mm < DIST_MAX_MM)
         filtered_depth = np.where(mask_jarak, depth_mm, 0)
         
-        # Segmentasi Wilayah ROI Vertikal (Membagi lebar layar 640 menjadi 3 Zona)
-        # Sisi Kiri: 0 - 213, Sisi Tengah: 214 - 426, Sisi Kanan: 427 - 640
-        lebar_frame = color_image.shape[1]
-        garis_kiri = lebar_frame // 3
-        garis_kanan = (lebar_frame // 3) * 2
-        
-        # Memotong matriks depth berdasarkan wilayah ROI pada baris tertentu (misal area deteksi roda depan)
-        # Kita ambil sampel baris piksel 300 hingga 400 (area bawah kamera/lantai terdekat)
-        baris_start, baris_end = 300, 400
-        
-        roi_kiri = filtered_depth[baris_start:baris_end, :garis_kiri]
-        roi_tengah = filtered_depth[baris_start:baris_end, garis_kiri:garis_kanan]
-        roi_kanan = filtered_depth[baris_start:baris_end, garis_kanan:]
-        
         # =====================================================================
-        # 5. LOGIKA EVALUASI PERMUKAAN TRACK (NAVIGASI & MITIGASI JURANG)
+        # 5. SCANNING DINAMIS UNTUK MENCARI TEPI LINTASAN (OUTPUT JURANG KANAN-KIRI)
         # =====================================================================
-        # Hitung rata-rata jarak di tiap ROI (abaikan nilai 0 hasil filter)
-        mean_kiri = np.mean(roi_kiri[roi_kiri > 0]) if np.any(roi_kiri > 0) else 0
-        mean_tengah = np.mean(roi_tengah[roi_tengah > 0]) if np.any(roi_tengah > 0) else 0
-        mean_kanan = np.mean(roi_kanan[roi_kanan > 0]) if np.any(roi_kanan > 0) else 0
+        # Tentukan baris piksel sampel sebagai area "Virtual Bumper" (misal baris 350)
+        baris_sampel = 350
         
-        # Logika Deteksi Tepi (Garis Warna)
-        warna_kiri = (0, 255, 0)   # Default Hijau (Aman)
-        warna_kanan = (0, 255, 0)  # Default Hijau (Aman)
-        status_navigasi = "ROBOT AMAN: JALUR TENGAH"
+        # Batas awal default jika tepi tidak ditemukan (di ujung layar)
+        tepi_kiri_x = 0
+        tepi_kanan_x = lebar_frame - 1
         
-        # Cek kondisi tepi terperosok (Jika rata-rata kedalaman melebihi batas atau 0/ruang kosong)
-        if mean_kiri > FLOOR_THRESHOLD_MM or mean_kiri == 0:
-            warna_kiri = (0, 0, 255) # Berubah Merah (Bahaya/Jurang Kiri)
-            status_navigasi = "PERINGATAN: KOREKSI YAW KE KANAN!"
-            
-        if mean_kanan > FLOOR_THRESHOLD_MM or mean_kanan == 0:
-            warna_kanan = (0, 0, 255) # Berubah Merah (Bahaya/Jurang Kanan)
-            status_navigasi = "PERINGATAN: KOREKSI YAW KE KIRI!"
-            
-        if (mean_kiri > FLOOR_THRESHOLD_MM or mean_kiri == 0) and (mean_kanan > FLOOR_THRESHOLD_MM or mean_kanan == 0):
-            status_navigasi = "JALUR SEMPIT: KUNCI HEADING YAW (IMU/LURUS)"
+        # Scan dari TENGAH LAYAR ke ARAH KIRI untuk mencari tepi kiri lintasan
+        for x in range(lebar_frame // 2, 0, -1):
+            jarak_piksel = filtered_depth[baris_sampel, x]
+            # Jika jarak terdeteksi sebagai jurang/patahan lantai atau kosong (0)
+            if jarak_piksel > FLOOR_THRESHOLD_MM or jarak_piksel == 0:
+                tepi_kiri_x = x
+                break
+                
+        # Scan dari TENGAH LAYAR ke ARAH KANAN untuk mencari tepi kanan lintasan
+        for x in range(lebar_frame // 2, lebar_frame):
+            jarak_piksel = filtered_depth[baris_sampel, x]
+            if jarak_piksel > FLOOR_THRESHOLD_MM or jarak_piksel == 0:
+                tepi_kanan_x = x
+                break
+
+        # Hitung koordinat tengah lintasan riil berdasarkan deteksi tepi
+        center_track_x = (tepi_kiri_x + tepi_kanan_x) // 2
+        center_kamera_x = lebar_frame // 2
+        
+        # Hitung Nilai Error Yaw (Pusat Kamera vs Pusat Lintasan Aktual)
+        error_yaw = center_kamera_x - center_track_x
+
+        # Tentukan status instruksi navigasi berdasarkan nilai error
+        if error_yaw > 20:
+            status_navigasi = f"KOREKSI: YAW KE KIRI (Err: {error_yaw})"
+        elif error_yaw < -20:
+            status_navigasi = f"KOREKSI: YAW KE KANAN (Err: {error_yaw})"
+        else:
+            status_navigasi = "ROBOT AMAN: JALUR TENGAH"
 
         # =====================================================================
-        # 6. VISUALISASI GRAFIS, GARIS ROI, DAN PENGHITUNG FPS
+        # 6. KALKULASI FPS & VISUALISASI GRAFIS DINAMIS
         # =====================================================================
-        # Menghitung FPS
+        # Menghitung nilai FPS secara real-time (Ditempatkan SEBELUM putText)
         new_frame_time = time.time()
         fps = 1 / (new_frame_time - prev_frame_time)
         prev_frame_time = new_frame_time
         fps_text = f"FPS: {int(fps)}"
         
-        # Menggambar Garis ROI Vertikal pembagi wilayah pada Raw Kamera
-        cv2.line(color_image, (garis_kiri, 0), (garis_kiri, 480), warna_kiri, 2)
-        cv2.line(color_image, (garis_kanan, 0), (garis_kanan, 480), warna_kanan, 2)
+        # 1. Menggambar GARIS TEPI KIRI ASLI (Warna Merah)
+        cv2.line(color_image, (tepi_kiri_x, 0), (tepi_kiri_x, tinggi_frame), (0, 0, 255), 2)
         
-        # Menggambar Kotak Area Sampel Deteksi Evaluasi Kedalaman (Baris 300 s.d 400)
-        cv2.rectangle(color_image, (0, baris_start), (lebar_frame, baris_end), (255, 255, 0), 1)
+        # 2. Menggambar GARIS TEPI KANAN ASLI (Warna Merah)
+        cv2.line(color_image, (tepi_kanan_x, 0), (tepi_kanan_x, tinggi_frame), (0, 0, 255), 2)
         
-        # Menampilkan teks status kontrol navigasi hasil analisa data depth
+        # 3. Menggambar TITIK TENGAH LINTASAN AKTUAL HASIL DETEKS_ PCL (Hijau)
+        cv2.circle(color_image, (center_track_x, baris_sampel), 8, (0, 255, 0), -1)
+        
+        # 4. Menggambar TITIK ACUAN TENGAH KAMERA (Putih)
+        cv2.circle(color_image, (center_kamera_x, baris_sampel), 5, (255, 255, 255), -1)
+        
+        # 5. Menggambar garis bantu horizontal area sensor virtual (Cyan)
+        cv2.line(color_image, (0, baris_sampel), (lebar_frame, baris_sampel), (255, 255, 0), 1)
+        
+        # 6. Menampilkan teks informasi status kontrol navigasi dan FPS ke layar
         cv2.putText(color_image, status_navigasi, (20, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Menampilkan nilai FPS di pojok kanan atas frame
         cv2.putText(color_image, fps_text, (520, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
         
-        # Tampilkan Window Gabungan RAW Kamera + Garis Tepi Analisis Depth PCL
+        # Tampilkan Window Hasil Overlay Gambar Kamera + Analisis Tepi PCL
         cv2.imshow("Combined RAW + PCL Edge View (KRSRI Research)", color_image)
         
-        # Logika tombol keluar program
+        # Tombol interupsi keluar program ('q')
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
             
 finally:
-    # Mematikan pipeline kamera saat aplikasi ditutup
+    # Memastikan pipeline hardware ditutup dengan bersih saat program stop
     pipeline.stop()
     cv2.destroyAllWindows()
     print("=== Program Dihentikan dengan Aman ===")
